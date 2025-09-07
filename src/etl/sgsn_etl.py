@@ -94,7 +94,7 @@ def main():
         combined = pd.concat(results, ignore_index=True)
         out_path = os.path.join(PROCESSED_DATA_PATH, "sgsn.parquet")
         combined.to_parquet(out_path, index=False)
-        logger.info(f"[SGSN] • {len(combined):,} lignes -> {out_path}")
+        logger.info(f"• SGSN {len(combined):,} enregistrements")
     else:
         logger.warning("[SGSN] Aucune donnée consolidée")
 
