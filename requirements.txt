@@ -1,3 +1,23 @@
+# Data Processing
 numpy==1.24.3
 pandas==2.0.3
-pyarrow==12.0.1
+pyarrow==12.0.1  # Pour le format Parquet
+dask==2023.9.0   # Pour le traitement parallèle
+distributed==2023.9.0  # Client Dask
+
+# Jupyter et visualisation
+jupyter==1.0.0
+notebook==7.0.2
+ipykernel==6.25.2
+
+# Compression et I/O
+gzip-reader==0.1.0
+
+# Logging et monitoring
+python-logging-base==0.2.0
+
+# Type hints
+typing-extensions==4.7.1
+
+# Optimisation
+python-snappy==0.6.1  # Pour la compression Parquet
