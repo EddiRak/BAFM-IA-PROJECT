@@ -105,7 +105,7 @@ def _process_group(files: List[str], columns: List[str], out_dir: str, out_name:
         combined = pd.concat(results, ignore_index=True)
         out_path = os.path.join(out_dir, out_name)
         combined.to_parquet(out_path, index=False)
-        logger.info(f"[OCC] • {out_dir} : {len(combined):,} lignes -> {out_path}")
+        logger.info(f"• Nombre d'enregistrement : {len(combined):,} enregistrements")
     else:
         logger.warning(f"[OCC] • {out_dir} : Aucune donnée consolidée")
 
