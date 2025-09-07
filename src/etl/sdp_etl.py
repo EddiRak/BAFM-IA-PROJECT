@@ -57,7 +57,7 @@ def parse_record(lines: List[str]) -> Tuple[str, Dict]:
             
             # Nettoyage des valeurs spéciales
             if value.endswith('D'):  # Valeur numérique suivie de 'D'
-                value = value[:-1]
+                value = value[:-2]
             elif value == "":  # Valeur vide
                 value = None
                 

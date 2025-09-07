@@ -3,13 +3,11 @@ import glob
 from typing import Dict, List, Tuple, Any, Optional
 import pandas as pd
 import dask.dataframe as dd
-from dask import delayed, compute
 from dask.distributed import Client
 import logging
 import time
 from datetime import datetime
 import gzip
-from modules.unzip_files import unzip_file
 
 # Configuration du logging avec format unifié
 logging.basicConfig(
@@ -314,11 +312,9 @@ def process_file(file_path: str) -> Dict[str, pd.DataFrame]:
     try:
         # Lecture et décompression du fichier si nécessaire
         if file_path.endswith('.gz'):
-            #logger.debug(f"Décompression du fichier {file_path}")
-            content = unzip_file(file_path)
-            content = content.decode('utf-8', errors='ignore')
+            with gzip.open(file_path, 'rb') as gz_file:
+                content = gz_file.read().decode('utf-8', errors='ignore')
         else:
-            #logger.debug(f"Lecture du fichier {file_path}")
             with open(file_path, 'rt', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
                 
