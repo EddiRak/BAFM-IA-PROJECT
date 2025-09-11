@@ -1,20 +1,20 @@
-import os, glob, time, gzip, logging
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
-
+# -*- coding: utf-8 -*-
+import os
 import pandas as pd
+import glob
+from datetime import datetime
+from typing import Dict, List, Tuple
+import logging
+import gzip
+import time
 import dask
 import dask.delayed as delayed
-import dask.dataframe as dd
-
-from modules.io_one_parquet import write_one_parquet
-from modules.dask_runtime import _start_client, quiet_close
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)-8s - %(message)s')
 logger = logging.getLogger(__name__)
 
 BASE_PATH = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-SOURCE_DATA_PATH = r"D:\Utilisateurs\Public\IA_BAFM\PROJECT\DATA_SAMPLE\CDR_EDR_zipped\SDP"
+SOURCE_DATA_PATH = r"/home/eddi/Desktop/CDR_EDR_unzipped/raw_data/SDP"
 RAW_DATA_PATH = os.environ.get("RAW_DATA_PATH", os.path.join(BASE_PATH, "data/raw_data/SDP"))
 
 RECORD_TYPES = {
@@ -23,7 +23,7 @@ RECORD_TYPES = {
     'LIFE_CYCLE_CHANGE': "SdpoutputCdr2_255_CS6.SDPCallDataRecord.lifeCycleChange"
 }
 
-def parse_record(lines: List[str]) -> Tuple[Optional[str], Dict]:
+def parse_record(lines: List[str]) -> Tuple[str, Dict]:
     if not lines: return None, {}
     record_type = lines[0].strip(); data = {}
     for line in lines[2:-1]:
@@ -37,112 +37,102 @@ def parse_record(lines: List[str]) -> Tuple[Optional[str], Dict]:
         data[key] = value
     return record_type, data
 
-def _read_text(path: str) -> str:
-    if path.endswith('.gz'):
-        with gzip.open(path, 'rt') as f: return f.read()
-    with open(path, 'r') as f: return f.read()
+def _read_text(fp: str) -> str:
+    if fp.endswith('.gz'):
+        with gzip.open(fp, 'rt', encoding='utf-8', errors='ignore') as f: return f.read()
+    with open(fp, 'rt', encoding='utf-8', errors='ignore') as f: return f.read()
 
-@delayed
-def process_file_delayed(file_path: str) -> Dict[str, pd.DataFrame]:
-    try:
-        content = _read_text(file_path)
-        records, current_record = [], []
-        for line in content.split('\n'):
-            line = line.strip()
-            if not line: continue
-            if line in [RECORD_TYPES['ACCOUNT_ADJUSTMENT'], RECORD_TYPES['PERIODIC_ACCOUNT_MGMT'], RECORD_TYPES['LIFE_CYCLE_CHANGE']]:
-                if current_record: records.append(parse_record(current_record))
-                current_record = [line]
-            else:
-                current_record.append(line)
-        if current_record: records.append(parse_record(current_record))
-        adj = [rec[1] for rec in records if rec[0] == RECORD_TYPES['ACCOUNT_ADJUSTMENT']]
-        per = [rec[1] for rec in records if rec[0] == RECORD_TYPES['PERIODIC_ACCOUNT_MGMT']]
-        lcc = [rec[1] for rec in records if rec[0] == RECORD_TYPES['LIFE_CYCLE_CHANGE']]
-        adj_df = pd.DataFrame(adj) if adj else pd.DataFrame()
-        per_df = pd.DataFrame(per) if per else pd.DataFrame()
-        lcc_df = pd.DataFrame(lcc) if lcc else pd.DataFrame()
-        for df in (adj_df, per_df, lcc_df):
-            if not df.empty:
-                if 'adjustmentDate' in df.columns and 'adjustmentTime' in df.columns:
-                    df['timestamp'] = pd.to_datetime(df['adjustmentDate'] + df['adjustmentTime'], format='%Y%m%d%H%M%S', errors='ignore')
-                elif 'timeStamp' in df.columns:
-                    df['timestamp'] = pd.to_datetime(df['timeStamp'].str[:14], format='%Y%m%d%H%M%S', errors='ignore')
-        return {'adjustments': adj_df, 'periodic': per_df, 'life_cycle': lcc_df}
-    except Exception as e:
-        logger.error(f"Erreur {file_path}: {str(e)}")
-        return {'adjustments': pd.DataFrame(), 'periodic': pd.DataFrame(), 'life_cycle': pd.DataFrame()}
+def _safe_parquet_name(src_path: str) -> str:
+    base = os.path.basename(src_path)
+    if base.endswith(".gz"): base = base[:-3]
+    return os.path.splitext(base)[0] + ".parquet"
 
-def _meta(cols: List[str]) -> pd.DataFrame:
-    return pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
+def _process_and_write_one(file_path: str, out_root: str) -> Dict[str, int]:
+    """Parse le fichier SDP et écrit jusqu'à 3 parquets (1 par famille)."""
+    content = _read_text(file_path)
+    records, current = [], []
+    for line in content.split('\n'):
+        line = line.strip()
+        if not line: continue
+        if line in RECORD_TYPES.values():
+            if current: records.append(parse_record(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current: records.append(parse_record(current))
 
-def _family_ddf(tasks: List[delayed], key: str) -> dd.DataFrame:
-    delayed_frames = [t.map(lambda d, k=key: d.get(k, pd.DataFrame())) for t in tasks]
-    # déduire colonnes
-    head = []
-    for df_del in delayed_frames[:5]:
-        try:
-            df0 = df_del.compute()
-            if not df0.empty:
-                head.append(df0.iloc[:0])
-        except Exception:
-            pass
-    cols = list(pd.concat(head, ignore_index=True).columns) if head else ["__dummy__"]
-    return dd.from_delayed(delayed_frames, meta=_meta(cols))
+    groups = {'ACCOUNT_ADJUSTMENT': [], 'PERIODIC_ACCOUNT_MGMT': [], 'LIFE_CYCLE_CHANGE': []}
+    for rec_type, row in records:
+        if rec_type == RECORD_TYPES['ACCOUNT_ADJUSTMENT']: groups['ACCOUNT_ADJUSTMENT'].append(row)
+        elif rec_type == RECORD_TYPES['PERIODIC_ACCOUNT_MGMT']: groups['PERIODIC_ACCOUNT_MGMT'].append(row)
+        elif rec_type == RECORD_TYPES['LIFE_CYCLE_CHANGE']: groups['LIFE_CYCLE_CHANGE'].append(row)
+
+    stats = {k: 0 for k in groups.keys()}
+    for k, rows in groups.items():
+        if not rows: continue
+        df = pd.DataFrame(rows)
+        # petites normalisations de temps si dispo
+        if 'adjustmentDate' in df.columns and 'adjustmentTime' in df.columns:
+            try: df['timestamp'] = pd.to_datetime(df['adjustmentDate'] + df['adjustmentTime'], format='%Y%m%d%H%M%S')
+            except Exception: pass
+        elif 'timeStamp' in df.columns:
+            try: df['timestamp'] = pd.to_datetime(df['timeStamp'].str[:14], format='%Y%m%d%H%M%S')
+            except Exception: pass
+
+        out_dir = os.path.join(out_root, k)
+        os.makedirs(out_dir, exist_ok=True)
+        out_file = os.path.join(out_dir, _safe_parquet_name(file_path))
+        df.to_parquet(out_file, index=False, engine="pyarrow")
+        stats[k] = len(df)
+
+    return stats
 
 def main():
-    start_time = time.time()
+    t0 = time.time()
     logger.info("-" * 50)
     logger.info("ETL SDP - Démarrage")
     logger.info(f"• Date      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"• Source    : {os.path.basename(SOURCE_DATA_PATH)}")
     logger.info(f"• Cible     : {os.path.basename(RAW_DATA_PATH)}")
 
-    for d in ["ACCOUNT_ADJUSTMENT", "PERIODIC_ACCOUNT_MGMT", "LIFE_CYCLE_CHANGE"]:
-        os.makedirs(os.path.join(RAW_DATA_PATH, d), exist_ok=True)
+    for sub in ["ACCOUNT_ADJUSTMENT", "PERIODIC_ACCOUNT_MGMT", "LIFE_CYCLE_CHANGE"]:
+        os.makedirs(os.path.join(RAW_DATA_PATH, sub), exist_ok=True)
 
-    asn_files = glob.glob(os.path.join(SOURCE_DATA_PATH, "*.ASN")) + glob.glob(os.path.join(SOURCE_DATA_PATH, "*.ASN.gz"))
-    if not asn_files:
+    files = glob.glob(os.path.join(SOURCE_DATA_PATH, "*.ASN")) + \
+            glob.glob(os.path.join(SOURCE_DATA_PATH, "*.ASN.gz"))
+    if not files:
         logger.error(f"Aucun fichier ASN ou ASN.gz trouvé dans {SOURCE_DATA_PATH}")
         return
-    logger.info(f"• À traiter : {len(asn_files)} fichiers")
+    logger.info(f"• À traiter : {len(files)} fichiers")
 
-    tasks = [process_file_delayed(fp) for fp in asn_files]
+    tasks = [delayed(_process_and_write_one)(fp, RAW_DATA_PATH) for fp in files]
 
-    ddfs = {
-        'adjustments': _family_ddf(tasks, 'adjustments'),
-        'periodic':    _family_ddf(tasks, 'periodic'),
-        'life_cycle':  _family_ddf(tasks, 'life_cycle'),
-    }
-
+    from modules.dask_runtime import _start_client, quiet_close
     client = _start_client()
     try:
-        logger.info("\nSauvegarde des fichiers parquet...")
-        with dask.config.set(optimizations=[], optimize_graph=False):
-            persisted = {k: v.persist() for k, v in ddfs.items()}
-
-        if persisted['adjustments'].npartitions > 0:
-            write_one_parquet(persisted['adjustments'], os.path.join(RAW_DATA_PATH, "ACCOUNT_ADJUSTMENT/account_adjustments.parquet"))
-        if persisted['periodic'].npartitions > 0:
-            write_one_parquet(persisted['periodic'], os.path.join(RAW_DATA_PATH, "PERIODIC_ACCOUNT_MGMT/periodic_account_mgmt.parquet"))
-        if persisted['life_cycle'].npartitions > 0:
-            write_one_parquet(persisted['life_cycle'], os.path.join(RAW_DATA_PATH, "LIFE_CYCLE_CHANGE/life_cycle_changes.parquet"))
-
-        total = 0
-        for name, ddf in persisted.items():
-            n = int(ddf.map_partitions(len, meta=("rows", "i8")).sum().compute(optimize_graph=False))
-            logger.info(f"• {name:<20}: {n:,} enregistrements")
-            total += n
-
-        execution_time = time.time() - start_time
-        logger.info("="*70)
-        logger.info("\nRésultats du traitement:")
-        logger.info(f"• Fichiers traités : {len(asn_files):,}")
-        logger.info(f"• Total des enregistrements   : {total:,}")
-        logger.info(f"• Temps d'exécution           : {execution_time:.2f} secondes")
-        logger.info("="*70 + "\n")
+        results: List[Dict[str, int]] = dask.compute(*tasks)
     finally:
         quiet_close(client)
+
+    totals = {"ACCOUNT_ADJUSTMENT": 0, "PERIODIC_ACCOUNT_MGMT": 0, "LIFE_CYCLE_CHANGE": 0}
+    ok = ko = 0
+    for st in results:
+        rows = sum(st.values())
+        ok += 1 if rows > 0 else 0
+        ko += 0 if rows > 0 else 1
+        for k in totals: totals[k] += st.get(k, 0)
+
+    dt = time.time() - t0
+    logger.info("="*70)
+    logger.info("Résultats du traitement:")
+    logger.info(f"• ACCOUNT_ADJUSTMENT    : {totals['ACCOUNT_ADJUSTMENT']:,}")
+    logger.info(f"• PERIODIC_ACCOUNT_MGMT : {totals['PERIODIC_ACCOUNT_MGMT']:,}")
+    logger.info(f"• LIFE_CYCLE_CHANGE     : {totals['LIFE_CYCLE_CHANGE']:,}")
+    logger.info(f"• Fichiers avec données : {ok:,}")
+    logger.info(f"• Fichiers sans données : {ko:,}")
+    logger.info(f"• Total enregistrements : {sum(totals.values()):,}")
+    logger.info(f"• Temps d'exécution     : {dt:.2f} s")
+    logger.info("=" * 70 + "\n")
 
 if __name__ == "__main__":
     main()

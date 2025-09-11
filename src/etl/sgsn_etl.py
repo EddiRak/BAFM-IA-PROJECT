@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)-8s - %(message)s')
 logger = logging.getLogger(__name__)
 
 BASE_PATH = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-SOURCE_DATA_PATH = r"D:\Utilisateurs\Public\IA_BAFM\\PROJECT\DATA_SAMPLE\CDR_EDR_zipped\GGSN"
+SOURCE_DATA_PATH = r"/home/eddi/Desktop/CDR_EDR_unzipped/raw_data/SGSN"
 RAW_DATA_PATH = os.environ.get("RAW_DATA_PATH", os.path.join(BASE_PATH, "data/raw_data/GGSN"))
 
 PATTERN = "MGANPGW*"
@@ -55,15 +55,29 @@ def main():
 
     logger.info("\nSauvegarde Parquet...")
 
+    # Client Dask silencieux + fermeture propre
+    from modules.dask_runtime import _start_client, quiet_close
     client = _start_client()
     try:
-        with dask.config.set(optimizations=[], optimize_graph=False):
-            ddf_p = ddf.persist()
-        out_path = os.path.join(RAW_DATA_PATH, "ggsn.parquet")
-        write_one_parquet(ddf_p, out_path)
-        total_rows = int(ddf_p.map_partitions(len, meta=("rows", "i8")).sum().compute(optimize_graph=False))
+        out_path = os.path.join(RAW_DATA_PATH)
+        #write_one_parquet(ddf, out_path)
+        ddf.to_parquet(
+            out_path,                # <-- un répertoire (ex: ".../ccn_dataset/")
+            write_index=False,
+            compression="snappy",        # zstd si CPU OK
+            engine="pyarrow",
+            #partition_on=["callStartDate"]   # ou toute colonne de partition logique
+        )
+
+        # >>> FIX ICI : comptage robuste (évite l’erreur .sum sur int)
+        total_rows = int(ddf.shape[0].compute())
+        # Variante fallback si jamais shape[0] n’est pas supporté dans un environnement :
+        # if not isinstance(total_rows, int):
+        #     total_rows = int(ddf.map_partitions(lambda pdf: len(pdf)).compute())  # pas de .sum() dask ici
+
     finally:
         quiet_close(client)
+
 
     exec_time = time.time() - start_time
     logger.info("="*70)

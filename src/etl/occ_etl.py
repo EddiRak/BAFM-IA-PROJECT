@@ -13,8 +13,8 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)-8s - %(message)s')
 logger = logging.getLogger(__name__)
 
 BASE_PATH = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-SOURCE_DATA_PATH_DATA = r"D:\Utilisateurs\Public\IA_BAFM\PROJECT\DATA_SAMPLE\CDR_EDR_zipped\OCC-DATA"
-SOURCE_DATA_PATH_SMS  = r"D:\Utilisateurs\Public\IA_BAFM\PROJECT\DATA_SAMPLE\CDR_EDR_zipped\OCC-SMS"
+SOURCE_DATA_PATH_DATA = r"/home/eddi/Desktop/CDR_EDR_unzipped/raw_data/OCC"
+SOURCE_DATA_PATH_SMS  = r"/home/eddi/Desktop/CDR_EDR_unzipped/raw_data/OCC"
 
 RAW_DATA_PATH_DATA = os.environ.get("RAW_DATA_OCC_DATA", os.path.join(BASE_PATH, "data/raw_data/OCC/OCC-DATA"))
 RAW_DATA_PATH_SMS  = os.environ.get("RAW_DATA_OCC_SMS",  os.path.join(BASE_PATH, "data/raw_data/OCC/OCC-SMS"))
@@ -56,15 +56,29 @@ def _process_group(files: List[str], columns: List[str], out_dir: str, out_name:
     ddf = ddf.drop(columns="__path")
 
     logger.info("\nSauvegarde Parquet...")
+    # Client Dask silencieux + fermeture propre
+    from modules.dask_runtime import _start_client, quiet_close
     client = _start_client()
     try:
-        with dask.config.set(optimizations=[], optimize_graph=False):
-            ddf_p = ddf.persist()
-        out_path = os.path.join(out_dir, out_name)
-        write_one_parquet(ddf_p, out_path)
-        total_rows = int(ddf_p.map_partitions(len, meta=("rows","i8")).sum().compute(optimize_graph=False))
+        out_path = os.path.join(out_dir)
+        #write_one_parquet(ddf, out_path)
+                # au lieu de write_one_parquet(ddf, out_path)  # (consolide)
+        ddf.to_parquet(
+            out_path,                # <-- un répertoire (ex: ".../ccn_dataset/")
+            write_index=False,
+            compression="snappy",        # zstd si CPU OK
+            engine="pyarrow",
+            #partition_on=["callStartDate"]   # ou toute colonne de partition logique
+        )
+        # >>> FIX ICI : comptage robuste (évite l’erreur .sum sur int)
+        total_rows = int(ddf.shape[0].compute())
+        # Variante fallback si jamais shape[0] n’est pas supporté dans un environnement :
+        # if not isinstance(total_rows, int):
+        #     total_rows = int(ddf.map_partitions(lambda pdf: len(pdf)).compute())  # pas de .sum() dask ici
+
     finally:
         quiet_close(client)
+
 
     return {"files_ok": len(files), "files_ko": 0, "rows": total_rows}
 

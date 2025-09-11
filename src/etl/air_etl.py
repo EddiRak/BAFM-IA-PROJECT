@@ -1,20 +1,20 @@
-import os, glob, time, gzip, logging
+# -*- coding: utf-8 -*-
+import os
+import glob
+import logging
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-
 import pandas as pd
+import gzip
 import dask
 import dask.delayed as delayed
-import dask.dataframe as dd
-
-from modules.io_one_parquet import write_one_parquet
-from modules.dask_runtime import _start_client, quiet_close
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)-8s - %(message)s")
 logger = logging.getLogger(__name__)
 
 BASE_PATH = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-SOURCE_DATA_PATH = r"D:\Utilisateurs\Public\IA_BAFM\PROJECT\DATA_SAMPLE\CDR_EDR_zipped\AIR"
+SOURCE_DATA_PATH = r"/home/eddi/Desktop/CDR_EDR_unzipped/raw_data/AIR"
 RAW_DATA_PATH = os.environ.get("RAW_DATA_PATH", os.path.join(BASE_PATH, "data/raw_data/AIR"))
 
 RECORD_TYPES = {
@@ -23,6 +23,7 @@ RECORD_TYPES = {
 }
 OUTPUT_DIRS = {"ADJUSTMENT": "adjustmentRecordV2", "REFILL": "refillRecordV2"}
 
+# --------- utils / parser (inchangés) ---------
 def _clean_value(v: str) -> Optional[str]:
     v = v.strip()
     if v == "": return None
@@ -44,7 +45,8 @@ def _flatten(d: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
 def _parse_block(lines: List[str], start_idx: int) -> Tuple[Dict[str, Any], int]:
     node: Dict[str, Any] = {}
     i = start_idx; n = len(lines)
-    def is_open_brace_line(idx: int) -> bool: return 0 <= idx < n and lines[idx].strip() == "{"
+    def is_open_brace_line(idx: int) -> bool:
+        return 0 <= idx < n and lines[idx].strip() == "{"
     while i < n:
         line = lines[i].strip()
         if not line: i += 1; continue
@@ -105,22 +107,26 @@ def _read_file_text(file_path: str) -> str:
     else:
         with open(file_path, "rt", encoding="utf-8", errors="ignore") as f: return f.read()
 
-@delayed
-def process_file_delayed(file_path: str) -> Dict[str, pd.DataFrame]:
-    try:
-        content = _read_file_text(file_path)
-        records = read_air_file(content)
-        return {
-            "ADJUSTMENT": to_dataframe(records, RECORD_TYPES["ADJUSTMENT"]),
-            "REFILL":     to_dataframe(records, RECORD_TYPES["REFILL"]),
-        }
-    except Exception as e:
-        logger.error(f"Erreur fichier {file_path}: {e}")
-        return {"ADJUSTMENT": pd.DataFrame(), "REFILL": pd.DataFrame()}
+def _safe_parquet_name(src_path: str) -> str:
+    base = os.path.basename(src_path)
+    if base.endswith(".gz"): base = base[:-3]
+    return os.path.splitext(base)[0] + ".parquet"
 
-def _empty_meta(cols: List[str]) -> pd.DataFrame:
-    # meta homogène (object)
-    return pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
+def _process_and_write_one(file_path: str, out_root: str) -> Dict[str, int]:
+    """Delayed-friendly: parse le fichier et écrit 0..2 parquets (ADJUSTMENT/REFILL). Retourne le nb de lignes par type."""
+    content = _read_file_text(file_path)
+    recs = read_air_file(content)
+    stats = {"ADJUSTMENT": 0, "REFILL": 0}
+    for label, rec_type in RECORD_TYPES.items():
+        df = to_dataframe(recs, rec_type)
+        if not df.empty:
+            out_dir = os.path.join(out_root, OUTPUT_DIRS[label])
+            os.makedirs(out_dir, exist_ok=True)
+            out_file = os.path.join(out_dir, _safe_parquet_name(file_path))
+            # un fichier parquet par fichier source (pas d’append, pas d’agrégation)
+            df.to_parquet(out_file, index=False, engine="pyarrow")
+            stats[label] = len(df)
+    return stats
 
 def main():
     start = time.time()
@@ -130,8 +136,8 @@ def main():
     logger.info(f"• Source : {os.path.basename(SOURCE_DATA_PATH)}")
     logger.info(f"• Cible  : {os.path.basename(RAW_DATA_PATH)}")
 
-    for k, d in OUTPUT_DIRS.items():
-        os.makedirs(os.path.join(RAW_DATA_PATH, d), exist_ok=True)
+    for k in OUTPUT_DIRS.values():
+        os.makedirs(os.path.join(RAW_DATA_PATH, k), exist_ok=True)
 
     air_files = sorted(glob.glob(os.path.join(SOURCE_DATA_PATH, "*.AIR"))) + \
                 sorted(glob.glob(os.path.join(SOURCE_DATA_PATH, "*.AIR.gz")))
@@ -140,51 +146,34 @@ def main():
         return
     logger.info(f"• À traiter : {len(air_files)} fichiers")
 
-    tasks = [process_file_delayed(fp) for fp in air_files]
+    # Planifier en parallèle : une tâche Dask par fichier
+    tasks = [delayed(_process_and_write_one)(fp, RAW_DATA_PATH) for fp in air_files]
 
-    # Fan-out: extraire 2 familles de DDF à partir des outputs retardés
-    def _family_ddf(family: str) -> dd.DataFrame:
-        delayed_frames = [t.map(lambda d: d.get(family, pd.DataFrame())) for t in tasks]
-        # Construire un meta robuste : on évalue une petite tête pour colonnes
-        head = []
-        for df_del in delayed_frames[:5]:
-            try:
-                df0 = df_del.compute()
-                if not df0.empty:
-                    head.append(df0.iloc[:0])
-            except Exception:
-                pass
-        cols = list(pd.concat(head, ignore_index=True).columns) if head else []
-        if not cols:  # aucun échantillon non-vide
-            cols = ["__dummy__"]  # évite from_delayed vide
-        meta = _empty_meta(cols)
-        return dd.from_delayed(delayed_frames, meta=meta)
-
-    ddfs = {fam: _family_ddf(fam) for fam in OUTPUT_DIRS.keys()}
-
+    from modules.dask_runtime import _start_client, quiet_close
     client = _start_client()
     try:
-        logger.info("\nSauvegarde Parquet...")
-        with dask.config.set(optimizations=[], optimize_graph=False):
-            persisted = {k: v.persist() for k, v in ddfs.items() if v is not None}
-        for k, ddf in persisted.items():
-            out_path = os.path.join(RAW_DATA_PATH, OUTPUT_DIRS[k], f"{OUTPUT_DIRS[k]}.parquet")
-            write_one_parquet(ddf, out_path)
-        total_rows = 0
-        for k, ddf in persisted.items():
-            n = int(ddf.map_partitions(len, meta=("rows", "i8")).sum().compute(optimize_graph=False))
-            total_rows += n
-            logger.info(f"• {k}: {n:,} enregistrements")
-
-        elapsed = time.time() - start
-        logger.info("="*70)
-        logger.info("Résultats du traitement:")
-        logger.info(f"• Fichiers traités : {len(air_files):,}")
-        logger.info(f"• Total enregistrements : {total_rows:,}")
-        logger.info(f"• Temps d'exécution     : {elapsed:.2f} sec")
-        logger.info("="*70 + "\n")
+        results: List[Dict[str, int]] = dask.compute(*tasks)
     finally:
         quiet_close(client)
+
+    total = {"ADJUSTMENT": 0, "REFILL": 0}
+    ok = ko = 0
+    for st in results:
+        rows = sum(st.values())
+        ok += 1 if rows > 0 else 0
+        ko += 0 if rows > 0 else 1
+        for k in total: total[k] += st.get(k, 0)
+
+    elapsed = time.time() - start
+    logger.info("="*70)
+    logger.info("Résultats du traitement:")
+    logger.info(f"• Fichiers avec données : {ok:,}")
+    logger.info(f"• Fichiers sans données : {ko:,}")
+    logger.info(f"• ADJUSTMENT            : {total['ADJUSTMENT']:,}")
+    logger.info(f"• REFILL                : {total['REFILL']:,}")
+    logger.info(f"• Total enregistrements : {(total['ADJUSTMENT']+total['REFILL']):,}")
+    logger.info(f"• Temps d'exécution     : {elapsed:.2f} s")
+    logger.info("=" * 70 + "\n")
 
 if __name__ == "__main__":
     main()
