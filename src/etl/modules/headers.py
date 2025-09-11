@@ -28,7 +28,7 @@ CCN_HEADERS: List[str] = [
     "bonusCreditClearance","bonusServiceRemoval","bonusOffer","mccmnc","FileSourceName"
 ]
 
-SGSN_HEADERS: List[str] = [
+GGSN_HEADERS: List[str] = [
     "recordType","servedIMSI","p-GWAddress","chargingID","servingNodeAddress","accessPointNameNI","pdpPDNType",
     "servedPDPPDNAddress","dynamicAddressFlag","qosNegotiated","dataVolumeGPRSUplink","dataVolumeGPRSDownlink",
     "changeCondition","changeTime","recordOpeningTime","duration","causeForRecClosing","diagnostics",
@@ -45,10 +45,10 @@ def load_headers() -> Dict[str, List[str]]:
     Retourne les en-têtes exacts, sans auto-inférence.
     - OCC -> fichiers MGGOCC (.ber, .ber_NP, .ber-SMS)
     - CCN -> fichiers CCNCDR*
-    - SGSN -> fichiers MGAOCC* (PGW) '|' délimités
+    - GGSN -> fichiers MGAOCC* (PGW) '|' délimités
     """
     return {
         "OCC": OCC_HEADERS,
         "CCN": CCN_HEADERS,
-        "SGSN": SGSN_HEADERS,
+        "GGSN": GGSN_HEADERS,
     }

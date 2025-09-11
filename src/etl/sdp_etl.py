@@ -1,247 +1,148 @@
-import os
-import pandas as pd
-import dask.dataframe as dd
-from dask import delayed, compute
-from dask.distributed import Client
-import glob
+import os, glob, time, gzip, logging
 from datetime import datetime
-from typing import Dict, List, Tuple
-from io import BytesIO
-import logging
-import gzip
-import time
-from modules.unzip_files import unzip_file
+from typing import Dict, List, Tuple, Optional
 
-# Configuration du logging avec format unifié
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(levelname)-8s - %(message)s'
-)
+import pandas as pd
+import dask
+import dask.delayed as delayed
+import dask.dataframe as dd
+
+from modules.io_one_parquet import write_one_parquet
+from modules.dask_runtime import _start_client, quiet_close
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)-8s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ------------------ Configuration ------------------
 BASE_PATH = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-RAW_DATA_PATH = os.environ.get("RAW_DATA_PATH", os.path.join(BASE_PATH, "raw_data/SDP"))
-PROCESSED_DATA_PATH = os.environ.get("PROCESSED_DATA_PATH", os.path.join(BASE_PATH, "processed_data/ETL/SDP"))
+SOURCE_DATA_PATH = r"D:\Utilisateurs\Public\IA_BAFM\PROJECT\DATA_SAMPLE\CDR_EDR_zipped\SDP"
+RAW_DATA_PATH = os.environ.get("RAW_DATA_PATH", os.path.join(BASE_PATH, "data/raw_data/SDP"))
 
-# Types d'enregistrements supportés
 RECORD_TYPES = {
     'ACCOUNT_ADJUSTMENT': "SdpoutputCdr2_255_CS6.SDPCallDataRecord.accountAdjustment",
     'PERIODIC_ACCOUNT_MGMT': "SdpoutputCdr2_255_CS6.SDPCallDataRecord.periodicAccountMgmt",
     'LIFE_CYCLE_CHANGE': "SdpoutputCdr2_255_CS6.SDPCallDataRecord.lifeCycleChange"
 }
 
-def parse_record(lines: List[str]) -> Tuple[str, Dict]:
-    """Parse un enregistrement du fichier ASN et retourne son type et les données."""
-    if not lines:
-        return None, {}
-        
-    record_type = lines[0].strip()
-    data = {}
-    
-    for line in lines[2:-1]:  # Skip first and last lines (type and closing brace)
+def parse_record(lines: List[str]) -> Tuple[Optional[str], Dict]:
+    if not lines: return None, {}
+    record_type = lines[0].strip(); data = {}
+    for line in lines[2:-1]:
         line = line.strip()
-        if not line or line.startswith('{') or line.endswith('}'):
-            continue
-            
-        try:
-            # Utiliser split avec maxsplit=1 pour gérer les valeurs contenant des ':'
-            parts = line.split(':', 1)
-            if len(parts) != 2:
-                print(f"Warning: ligne mal formatée ignorée: {line}")
-                continue
-                
-            key, value = parts
-            key = key.strip()
-            value = value.strip().strip('"\'')
-            
-            # Nettoyage des valeurs spéciales
-            if value.endswith('D'):  # Valeur numérique suivie de 'D'
-                value = value[:-2]
-            elif value == "":  # Valeur vide
-                value = None
-                
-            data[key] = value
-            
-        except Exception as e:
-            print(f"Warning: erreur lors du parsing de la ligne: {line}")
-            print(f"Error: {str(e)}")
-            continue
-            
+        if not line or line.startswith('{') or line.endswith('}'): continue
+        parts = line.split(':', 1)
+        if len(parts) != 2: continue
+        key, value = parts; key = key.strip(); value = value.strip().strip('"\'')
+        if value.endswith('D'): value = value[:-2]
+        elif value == "": value = None
+        data[key] = value
     return record_type, data
 
-def process_file(file_path: str):
-    """Traite un fichier individuel de manière asynchrone."""
+def _read_text(path: str) -> str:
+    if path.endswith('.gz'):
+        with gzip.open(path, 'rt') as f: return f.read()
+    with open(path, 'r') as f: return f.read()
+
+@delayed
+def process_file_delayed(file_path: str) -> Dict[str, pd.DataFrame]:
     try:
-        logger.info(f"Début du traitement du fichier : {os.path.basename(file_path)}")
-        
-        # Décompresser le fichier si c'est un fichier .gz
-        if file_path.endswith('.gz'):
-            #logger.debug(f"Décompression du fichier {file_path}")
-            with gzip.open(file_path, 'rt') as f:
-                content = f.read()
-        else:
-            #logger.debug(f"Lecture du fichier non compressé {file_path}")
-            with open(file_path, 'r') as f:
-                content = f.read()
-        
-        #logger.info(f"Fichier lu avec succès, taille: {len(content)} caractères")
-        
-        # Parser les records directement
-        records = []
-        current_record = []
-        
+        content = _read_text(file_path)
+        records, current_record = [], []
         for line in content.split('\n'):
             line = line.strip()
-            if not line:
-                continue
-                
-            if line in [RECORD_TYPES['ACCOUNT_ADJUSTMENT'], 
-                      RECORD_TYPES['PERIODIC_ACCOUNT_MGMT'], 
-                      RECORD_TYPES['LIFE_CYCLE_CHANGE']]:
-                if current_record:
-                    records.append(parse_record(current_record))
+            if not line: continue
+            if line in [RECORD_TYPES['ACCOUNT_ADJUSTMENT'], RECORD_TYPES['PERIODIC_ACCOUNT_MGMT'], RECORD_TYPES['LIFE_CYCLE_CHANGE']]:
+                if current_record: records.append(parse_record(current_record))
                 current_record = [line]
             else:
                 current_record.append(line)
-                
-        if current_record:
-            records.append(parse_record(current_record))
-        
-        # Transformer en DataFrames
-        adj_records = [rec[1] for rec in records if rec[0] == RECORD_TYPES['ACCOUNT_ADJUSTMENT']]
-        periodic_records = [rec[1] for rec in records if rec[0] == RECORD_TYPES['PERIODIC_ACCOUNT_MGMT']]
-        life_cycle_records = [rec[1] for rec in records if rec[0] == RECORD_TYPES['LIFE_CYCLE_CHANGE']]
-        
-        adj_df = pd.DataFrame(adj_records) if adj_records else pd.DataFrame()
-        periodic_df = pd.DataFrame(periodic_records) if periodic_records else pd.DataFrame()
-        life_cycle_df = pd.DataFrame(life_cycle_records) if life_cycle_records else pd.DataFrame()
-        
-        # Conversion des timestamps et types numériques
-        for df in [adj_df, periodic_df, life_cycle_df]:
+        if current_record: records.append(parse_record(current_record))
+        adj = [rec[1] for rec in records if rec[0] == RECORD_TYPES['ACCOUNT_ADJUSTMENT']]
+        per = [rec[1] for rec in records if rec[0] == RECORD_TYPES['PERIODIC_ACCOUNT_MGMT']]
+        lcc = [rec[1] for rec in records if rec[0] == RECORD_TYPES['LIFE_CYCLE_CHANGE']]
+        adj_df = pd.DataFrame(adj) if adj else pd.DataFrame()
+        per_df = pd.DataFrame(per) if per else pd.DataFrame()
+        lcc_df = pd.DataFrame(lcc) if lcc else pd.DataFrame()
+        for df in (adj_df, per_df, lcc_df):
             if not df.empty:
                 if 'adjustmentDate' in df.columns and 'adjustmentTime' in df.columns:
-                    df['timestamp'] = pd.to_datetime(
-                        df['adjustmentDate'] + df['adjustmentTime'],
-                        format='%Y%m%d%H%M%S'
-                    )
+                    df['timestamp'] = pd.to_datetime(df['adjustmentDate'] + df['adjustmentTime'], format='%Y%m%d%H%M%S', errors='ignore')
                 elif 'timeStamp' in df.columns:
-                    df['timestamp'] = pd.to_datetime(
-                        df['timeStamp'].str[:14],
-                        format='%Y%m%d%H%M%S'
-                    )
-        
-        return {
-            'adjustments': adj_df,
-            'periodic': periodic_df,
-            'life_cycle': life_cycle_df
-        }
-        
+                    df['timestamp'] = pd.to_datetime(df['timeStamp'].str[:14], format='%Y%m%d%H%M%S', errors='ignore')
+        return {'adjustments': adj_df, 'periodic': per_df, 'life_cycle': lcc_df}
     except Exception as e:
-        logger.error(f"Erreur lors du traitement de {file_path}: {str(e)}")
-        return {
-            'adjustments': pd.DataFrame(),
-            'periodic': pd.DataFrame(),
-            'life_cycle': pd.DataFrame()
-        }
+        logger.error(f"Erreur {file_path}: {str(e)}")
+        return {'adjustments': pd.DataFrame(), 'periodic': pd.DataFrame(), 'life_cycle': pd.DataFrame()}
+
+def _meta(cols: List[str]) -> pd.DataFrame:
+    return pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
+
+def _family_ddf(tasks: List[delayed], key: str) -> dd.DataFrame:
+    delayed_frames = [t.map(lambda d, k=key: d.get(k, pd.DataFrame())) for t in tasks]
+    # déduire colonnes
+    head = []
+    for df_del in delayed_frames[:5]:
+        try:
+            df0 = df_del.compute()
+            if not df0.empty:
+                head.append(df0.iloc[:0])
+        except Exception:
+            pass
+    cols = list(pd.concat(head, ignore_index=True).columns) if head else ["__dummy__"]
+    return dd.from_delayed(delayed_frames, meta=_meta(cols))
 
 def main():
-    """Point d'entrée principal du processus ETL SDP."""
     start_time = time.time()
-    
     logger.info("-" * 50)
     logger.info("ETL SDP - Démarrage")
     logger.info(f"• Date      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"• Source    : {os.path.basename(RAW_DATA_PATH)}")
-    logger.info(f"• Cible     : {os.path.basename(PROCESSED_DATA_PATH)}")
+    logger.info(f"• Source    : {os.path.basename(SOURCE_DATA_PATH)}")
+    logger.info(f"• Cible     : {os.path.basename(RAW_DATA_PATH)}")
 
-    # Création des dossiers de sortie
-    output_dirs = ["ACCOUNT_ADJUSTMENT", "PERIODIC_ACCOUNT_MGMT", "LIFE_CYCLE_CHANGE"]
-    for dir_name in output_dirs:
-        os.makedirs(os.path.join(PROCESSED_DATA_PATH, dir_name), exist_ok=True)
+    for d in ["ACCOUNT_ADJUSTMENT", "PERIODIC_ACCOUNT_MGMT", "LIFE_CYCLE_CHANGE"]:
+        os.makedirs(os.path.join(RAW_DATA_PATH, d), exist_ok=True)
 
-    # Liste des fichiers à traiter
-    asn_files = glob.glob(os.path.join(RAW_DATA_PATH, "*.ASN")) + \
-                glob.glob(os.path.join(RAW_DATA_PATH, "*.ASN.gz"))
-    
+    asn_files = glob.glob(os.path.join(SOURCE_DATA_PATH, "*.ASN")) + glob.glob(os.path.join(SOURCE_DATA_PATH, "*.ASN.gz"))
     if not asn_files:
-        logger.error(f"Aucun fichier ASN ou ASN.gz trouvé dans {RAW_DATA_PATH}")
+        logger.error(f"Aucun fichier ASN ou ASN.gz trouvé dans {SOURCE_DATA_PATH}")
         return
-    
     logger.info(f"• À traiter : {len(asn_files)} fichiers")
-    
-    logger.info("\nTraitement des fichiers...")
-    
-    # Initialisation des accumulateurs
-    dataframes = {
-        'adjustments': [],
-        'periodic': [],
-        'life_cycle': []
-    }
-    stats = {
-        'réussis': 0,
-        'échecs': 0,
-        'total_records': 0
+
+    tasks = [process_file_delayed(fp) for fp in asn_files]
+
+    ddfs = {
+        'adjustments': _family_ddf(tasks, 'adjustments'),
+        'periodic':    _family_ddf(tasks, 'periodic'),
+        'life_cycle':  _family_ddf(tasks, 'life_cycle'),
     }
 
-    # Traitement des fichiers
-    for file_path in asn_files:
-        try:
-            result = process_file(file_path)
-            has_data = False
-            
-            for key, df in result.items():
-                if df is not None and not df.empty:
-                    dataframes[key].append(df)
-                    stats['total_records'] += len(df)
-                    has_data = True
-                    
-            if has_data:
-                stats['réussis'] += 1
-            else:
-                stats['échecs'] += 1
-                
-        except Exception as error:
-            logger.error(f"Erreur lors du traitement de {os.path.basename(file_path)}: {str(error)}")
-            stats['échecs'] += 1
-
-    logger.info("\nTraitement des fichiers terminé.")
-    
-    # Sauvegarde des résultats
-    logger.info("\nSauvegarde des fichiers parquet...")
-    
+    client = _start_client()
     try:
-        # ACCOUNT_ADJUSTMENT
-        if dataframes['adjustments']:
-            df = pd.concat(dataframes['adjustments'], ignore_index=True)
-            output_path = os.path.join(PROCESSED_DATA_PATH, "ACCOUNT_ADJUSTMENT/account_adjustments.parquet")
-            df.to_parquet(output_path, index=False)
-            logger.info(f"• ACCOUNT_ADJUSTMENT    : {len(df):,} enregistrements")
-        
-        # PERIODIC_ACCOUNT_MGMT
-        if dataframes['periodic']:
-            df = pd.concat(dataframes['periodic'], ignore_index=True)
-            output_path = os.path.join(PROCESSED_DATA_PATH, "PERIODIC_ACCOUNT_MGMT/periodic_account_mgmt.parquet")
-            df.to_parquet(output_path, index=False)
-            logger.info(f"• PERIODIC_ACCOUNT_MGMT : {len(df):,} enregistrements")
-        
-        # LIFE_CYCLE_CHANGE
-        if dataframes['life_cycle']:
-            df = pd.concat(dataframes['life_cycle'], ignore_index=True)
-            output_path = os.path.join(PROCESSED_DATA_PATH, "LIFE_CYCLE_CHANGE/life_cycle_changes.parquet")
-            df.to_parquet(output_path, index=False)
-            logger.info(f"• LIFE_CYCLE_CHANGE    : {len(df):,} enregistrements")
+        logger.info("\nSauvegarde des fichiers parquet...")
+        with dask.config.set(optimizations=[], optimize_graph=False):
+            persisted = {k: v.persist() for k, v in ddfs.items()}
 
-    except Exception as error:
-        logger.error(f"Erreur lors de la sauvegarde: {str(error)}")
-        raise
+        if persisted['adjustments'].npartitions > 0:
+            write_one_parquet(persisted['adjustments'], os.path.join(RAW_DATA_PATH, "ACCOUNT_ADJUSTMENT/account_adjustments.parquet"))
+        if persisted['periodic'].npartitions > 0:
+            write_one_parquet(persisted['periodic'], os.path.join(RAW_DATA_PATH, "PERIODIC_ACCOUNT_MGMT/periodic_account_mgmt.parquet"))
+        if persisted['life_cycle'].npartitions > 0:
+            write_one_parquet(persisted['life_cycle'], os.path.join(RAW_DATA_PATH, "LIFE_CYCLE_CHANGE/life_cycle_changes.parquet"))
 
-    # Résumé final
-    execution_time = time.time() - start_time
-    logger.info("="*70)
-    logger.info("\nRésultats du traitement:")
-    logger.info(f"• Fichiers traités avec succès : {stats['réussis']:,}")
-    logger.info(f"• Fichiers en erreur          : {stats['échecs']:,}")
-    logger.info(f"• Total des enregistrements   : {stats['total_records']:,}")
-    logger.info(f"• Temps d'exécution           : {execution_time:.2f} secondes")
-    logger.info("="*70 + "\n")
+        total = 0
+        for name, ddf in persisted.items():
+            n = int(ddf.map_partitions(len, meta=("rows", "i8")).sum().compute(optimize_graph=False))
+            logger.info(f"• {name:<20}: {n:,} enregistrements")
+            total += n
+
+        execution_time = time.time() - start_time
+        logger.info("="*70)
+        logger.info("\nRésultats du traitement:")
+        logger.info(f"• Fichiers traités : {len(asn_files):,}")
+        logger.info(f"• Total des enregistrements   : {total:,}")
+        logger.info(f"• Temps d'exécution           : {execution_time:.2f} secondes")
+        logger.info("="*70 + "\n")
+    finally:
+        quiet_close(client)
+
+if __name__ == "__main__":
+    main()
