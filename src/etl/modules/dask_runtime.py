@@ -5,8 +5,7 @@ import tempfile
 import yaml
 from pathlib import Path
 from contextlib import contextmanager
-from dask.distributed import Client
-from distributed import LocalCluster
+from dask.distributed import Client, LocalCluster
 
 # -------------------------------------------------------------------
 # 0) Chargement de la configuration
