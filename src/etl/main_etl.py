@@ -51,10 +51,10 @@ except Exception:
         occ_main = None
 
 try:
-    from etl.ggsn_etl import main as ggsn_main  # refactor selon le même modèle GGSN
+    from etl.sgsn_etl import main as ggsn_main  # refactor selon le même modèle GGSN
 except Exception:
     try:
-        from ggsn_etl import main as ggsn_main
+        from sgsn_etl import main as ggsn_main
     except Exception:
         ggsn_main = None
 

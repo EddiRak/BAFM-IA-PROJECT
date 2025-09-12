@@ -1,0 +1,31 @@
+### Configuration Dask pour le projet ETL CDR/EDR ###
+
+# Configuration des workers
+workers:
+  n_workers: 4  # Nombre de workers par défaut (peut être surchargé par DASK_WORKERS)
+  threads_per_worker: 1  # Nombre de threads par worker
+  memory_limit: "900MB"  # Limite de mémoire par worker
+  processes: true  # Utiliser le parallélisme multi-processus
+
+# Configuration des logs
+logging:
+  distributed: error
+  distributed.worker: error
+  distributed.scheduler: error
+  distributed.nanny: error
+  distributed.comm: error
+  tornado: critical
+  bokeh: critical
+
+# Configuration des chemins
+paths:
+  # Ordre de priorité pour le dossier temporaire:
+  # 1. DASK_TEMPORARY_DIRECTORY (variable d'environnement)
+  # 2. ./dask_tmp (relatif au dossier courant)
+  # 3. %TEMP%/dask_tmp
+  dask_tmp: "dask_tmp"  # Dossier par défaut relatif au projet
+  config_subdir: "dask_config"  # Sous-dossier pour la configuration
+
+# Configuration du dashboard
+dashboard:
+  enabled: false  # Désactiver le dashboard par défaut

@@ -2,18 +2,37 @@
 import os
 import logging
 import tempfile
+import yaml
 from pathlib import Path
 from contextlib import contextmanager
 from dask.distributed import Client
 from distributed import LocalCluster
 
 # -------------------------------------------------------------------
+# 0) Chargement de la configuration
+# -------------------------------------------------------------------
+def load_config():
+    config_path = Path(os.getcwd()) / "config" / "dask_settings.yaml"
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        logging.warning(f"Impossible de charger la configuration: {e}. Utilisation des valeurs par défaut.")
+        return {}
+
+# Configuration globale
+DASK_CONFIG = load_config()
+
+# -------------------------------------------------------------------
 # 1) Dossier temporaire fiable (écriture ok) pour spill et config
 # -------------------------------------------------------------------
 def _resolve_local_dir() -> str:
+    paths_config = DASK_CONFIG.get('paths', {})
+    default_tmp = paths_config.get('dask_tmp', 'dask_tmp')
+    
     for p in (
         os.environ.get("DASK_TEMPORARY_DIRECTORY"),
-        os.path.abspath(os.path.join(os.getcwd(), "dask_tmp")),
+        os.path.abspath(os.path.join(os.getcwd(), default_tmp)),
         os.path.join(tempfile.gettempdir(), "dask_tmp"),
     ):
         if not p:
@@ -40,17 +59,20 @@ def _ensure_quiet_dask_yaml(config_dir: str) -> None:
     cfg_dir = Path(config_dir)
     cfg_dir.mkdir(parents=True, exist_ok=True)
     yaml_path = cfg_dir / "dask.yaml"
-    # Niveau de logs minimal partout, coupe dashboard/tornado/bokeh
-    yaml_content = """\
-logging:
-  distributed: error
-  distributed.worker: error
-  distributed.scheduler: error
-  distributed.nanny: error
-  distributed.comm: error
-  tornado: critical
-  bokeh: critical
-"""
+    
+    # Utiliser la configuration des logs depuis le fichier de configuration
+    logging_config = DASK_CONFIG.get('logging', {
+        'distributed': 'error',
+        'distributed.worker': 'error',
+        'distributed.scheduler': 'error',
+        'distributed.nanny': 'error',
+        'distributed.comm': 'error',
+        'tornado': 'critical',
+        'bokeh': 'critical'
+    })
+    
+    yaml_content = yaml.dump({'logging': logging_config})
+    
     # Écrire seulement si absent ou différent
     try:
         if (not yaml_path.exists()) or (yaml_path.read_text(encoding="utf-8") != yaml_content):
@@ -105,30 +127,42 @@ def _suppress_all_logging():
 # 4) Point d'entrée: Client silencieux
 # -------------------------------------------------------------------
 def _start_client():
-    # Par défaut sobres pour RAM faible
-    n_workers = int(os.environ.get("DASK_WORKERS", str(min(2, (os.cpu_count() or 2)))))
-    threads_per_worker = int(os.environ.get("DASK_THREADS_PER_WORKER", "1"))
-    memory_limit = os.environ.get("DASK_MEMORY_LIMIT", "900MB")
+    workers_config = DASK_CONFIG.get('workers', {})
+    
+    # Configuration des workers avec valeurs par défaut
+    n_workers = int(os.environ.get("DASK_WORKERS", 
+                                 str(workers_config.get('n_workers', 
+                                                     min(2, (os.cpu_count() or 2))))))
+    threads_per_worker = int(os.environ.get("DASK_THREADS_PER_WORKER",
+                                          str(workers_config.get('threads_per_worker', 1))))
+    memory_limit = os.environ.get("DASK_MEMORY_LIMIT",
+                                workers_config.get('memory_limit', "900MB"))
 
     local_dir = _resolve_local_dir()
 
     # Préparer et activer une config Dask *silencieuse* pour les sous-processus
-    cfg_dir = os.path.join(local_dir, "dask_config")
+    paths_config = DASK_CONFIG.get('paths', {})
+    config_subdir = paths_config.get('config_subdir', 'dask_config')
+    cfg_dir = os.path.join(local_dir, config_subdir)
     _ensure_quiet_dask_yaml(cfg_dir)
 
     # Réduire aussi les logs dans le process parent
     _silence_parent_loggers(logging.ERROR)
+
+    # Dashboard configuration
+    dashboard_config = DASK_CONFIG.get('dashboard', {})
+    dashboard_address = None if not dashboard_config.get('enabled', False) else ':8787'
 
     # Créer le cluster en "mode muet" pour éviter le flot au bootstrap
     with _suppress_all_logging():
         cluster = LocalCluster(
             n_workers=n_workers,
             threads_per_worker=threads_per_worker,
-            processes=True,                 # garde le parallélisme multi-processus
+            processes=workers_config.get('processes', True),
             memory_limit=memory_limit,
             local_directory=local_dir,
-            dashboard_address=None,         # pas de dashboard
-            silence_logs=logging.ERROR,     # workers/scheduler en ERROR
+            dashboard_address=dashboard_address,
+            silence_logs=logging.ERROR,
         )
     return Client(cluster)
 
